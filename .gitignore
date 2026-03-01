@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+개인정보
+개인정보.txt
+.env
+*.sqlite3

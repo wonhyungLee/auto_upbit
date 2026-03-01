@@ -1,0 +1,550 @@
+--- a/upbit_strategy_engine.py
++++ b/upbit_strategy_engine.py
+@@ -292,6 +292,8 @@
+     stop_loss: float | None = None,
+     take_profit: float | None = None,
+     max_holding_days: int | None = None,
++    entry_cooldown_days: int | None = None,
++    min_holding_days: int | None = None,
+ ) -> BacktestResult:
+     # Collect union dates across markets
+     all_dates_set = set()
+@@ -303,6 +305,7 @@
+ 
+     cash = float(initial_capital)
+     positions: dict[str, Position] = {}
++    last_exit_day: dict[str, int] = {}
+     trades: list[dict] = []
+     equity_curve: list[float] = []
+     equity_dates: list[str] = []
+@@ -328,14 +331,17 @@
+             if today is None:
+                 continue
+             idx, close, _, prev_exit, _ = today
+-            should_exit = bool(prev_exit)
+-            if not should_exit:
+-                if stop_loss is not None and close <= pos.entry_price * (1.0 - stop_loss):
+-                    should_exit = True
+-                elif take_profit is not None and close >= pos.entry_price * (1.0 + take_profit):
+-                    should_exit = True
+-                elif max_holding_days is not None and (day_idx - pos.entry_day) >= max_holding_days:
+-                    should_exit = True
++            hold_days = day_idx - pos.entry_day
++
++            should_exit = False
++            if prev_exit and (min_holding_days is None or hold_days >= min_holding_days):
++                should_exit = True
++            if not should_exit and stop_loss is not None and close <= pos.entry_price * (1.0 - stop_loss):
++                should_exit = True
++            elif not should_exit and take_profit is not None and close >= pos.entry_price * (1.0 + take_profit):
++                should_exit = True
++            elif not should_exit and max_holding_days is not None and hold_days >= max_holding_days:
++                should_exit = True
+ 
+             if should_exit:
+                 proceeds = pos.qty * close * (1.0 - fee_rate) * (1.0 - slippage_rate)
+@@ -353,6 +359,7 @@
+                     }
+                 )
+                 del positions[market]
++                last_exit_day[market] = day_idx
+ 
+         # 2) rebalance based on ranked candidates
+         if day_idx % max(1, rebalance_every) == 0:
+@@ -378,6 +385,9 @@
+                             continue
+                         idx, close, _, _, _ = today
+                         pos = positions[mkt]
++                        hold_days = day_idx - pos.entry_day
++                        if min_holding_days is not None and hold_days < min_holding_days:
++                            continue
+                         proceeds = pos.qty * close * (1.0 - fee_rate) * (1.0 - slippage_rate)
+                         cash += proceeds
+                         pnl = proceeds - pos.entry_capital
+@@ -393,6 +403,7 @@
+                             }
+                         )
+                         del positions[mkt]
++                        last_exit_day[mkt] = day_idx
+ 
+                 # open targets
+                 for score, market in candidates:
+@@ -400,6 +411,10 @@
+                         break
+                     if market in positions:
+                         continue
++                    if entry_cooldown_days is not None:
++                        prev_exit_day = last_exit_day.get(market)
++                        if prev_exit_day is not None and (day_idx - prev_exit_day) < entry_cooldown_days:
++                            continue
+                     idx, close, _, _, _ = today_price[market]
+                     if close <= 0.0:
+                         continue
+@@ -522,6 +537,8 @@
+             "stop_loss": stop_loss,
+             "take_profit": take_profit,
+             "max_holding_days": max_holding_days,
++            "entry_cooldown_days": entry_cooldown_days,
++            "min_holding_days": min_holding_days,
+         },
+         final_capital=equity_curve[-1] if equity_curve else initial_capital,
+         total_return=total_ret,
+@@ -694,11 +711,13 @@
+     p.add_argument("--initial-capital", type=float, default=1_000_000, help="Starting KRW capital")
+     p.add_argument("--max-positions", type=int, default=3, help="Maximum concurrent positions")
+     p.add_argument("--rebalance-every", type=int, default=5, help="Rebalance frequency in days (1 = every day)")
+-    p.add_argument("--fee-bps", type=float, default=0.05, help="Fee per transaction in basis points")
++    p.add_argument("--fee-bps", type=float, default=1.0, help="Fee per transaction in basis points")
+     p.add_argument("--slippage-bps", type=float, default=0.0, help="Slippage in basis points")
+     p.add_argument("--stop-loss", type=float, default=0.08, help="Optional stop loss ratio (e.g. 0.08 = 8%%)")
+     p.add_argument("--take-profit", type=float, default=0.20, help="Optional take profit ratio (e.g. 0.20 = 20%%)")
+     p.add_argument("--max-holding-days", type=int, default=90, help="Maximum holding period in days")
++    p.add_argument("--entry-cooldown-days", type=int, default=0, help="Cooldown days after exit before re-entry")
++    p.add_argument("--min-holding-days", type=int, default=0, help="Minimum holding days before signal/rebalance exits")
+     p.add_argument("--min-data-days", type=int, default=120, help="Ignore coins with fewer rows than this")
+     p.add_argument("--optimize", action="store_true", help="Run parameter grid search instead of single config")
+     p.add_argument("--top", type=int, default=10, help="Show top N configs after optimization")
+@@ -764,6 +783,8 @@
+     stop_loss = args.stop_loss if args.stop_loss > 0 else None
+     take_profit = args.take_profit if args.take_profit > 0 else None
+     max_holding_days = args.max_holding_days if args.max_holding_days > 0 else None
++    entry_cooldown_days = args.entry_cooldown_days if args.entry_cooldown_days > 0 else None
++    min_holding_days = args.min_holding_days if args.min_holding_days > 0 else None
+ 
+     # prepare mode
+     if args.optimize:
+@@ -787,6 +808,8 @@
+                 stop_loss=stop_loss,
+                 take_profit=take_profit,
+                 max_holding_days=max_holding_days,
++                entry_cooldown_days=entry_cooldown_days,
++                min_holding_days=min_holding_days,
+             )
+             results.append(result)
+             if idx % 25 == 0:
+@@ -820,6 +843,8 @@
+         stop_loss=stop_loss,
+         take_profit=take_profit,
+         max_holding_days=max_holding_days,
++        entry_cooldown_days=entry_cooldown_days,
++        min_holding_days=min_holding_days,
+     )
+ 
+     print(
+--- a/btc_lag_walkforward.py
++++ b/btc_lag_walkforward.py
+@@ -69,10 +69,29 @@
+ 
+ def selection_key(result: engine.BacktestResult, objective: str) -> tuple[float, float, float]:
+     if objective == "return":
+-        return (result.total_return, result.sharpe, result.calmar)
++        return (result.total_return, result.calmar, result.sharpe)
+     return (result.sharpe, result.total_return, result.calmar)
+ 
+ 
++def annualized_trade_count(result: engine.BacktestResult) -> float:
++    days = max(1, len(result.equity_curve))
++    return result.trade_count * (365.0 / days)
++
++
++def top_markets_by_trade_count(trades: list[dict], *, side_prefix: str, top_n: int = 10) -> list[dict]:
++    counts: dict[str, int] = {}
++    for t in trades:
++        side = str(t.get("side", ""))
++        if side_prefix and not side.startswith(side_prefix):
++            continue
++        market = t.get("market")
++        if not market:
++            continue
++        counts[str(market)] = counts.get(str(market), 0) + 1
++    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
++    return [{"market": m, "count": c} for m, c in ranked[:top_n]]
++
++
+ def normalize_date(raw: str) -> str:
+     return raw.split("T", 1)[0]
+ 
+@@ -361,6 +380,8 @@
+     stop_loss: float,
+     take_profit: float,
+     max_holding_days: int,
++    entry_cooldown_days: int | None,
++    min_holding_days: int | None,
+ ) -> engine.BacktestResult | None:
+     copied = lagbt.copy_series_map(series)
+     lagbt.build_btc_lag_signals(
+@@ -397,6 +418,8 @@
+         stop_loss=stop_loss,
+         take_profit=take_profit,
+         max_holding_days=max_holding_days,
++        entry_cooldown_days=entry_cooldown_days,
++        min_holding_days=min_holding_days,
+     )
+     return result
+ 
+@@ -586,11 +609,15 @@
+                 stop_loss=args.stop_loss,
+                 take_profit=args.take_profit,
+                 max_holding_days=args.max_holding_days,
++                entry_cooldown_days=args.entry_cooldown_days,
++                min_holding_days=args.min_holding_days,
+             )
+             if result is None:
+                 continue
+             if result.trade_count < min_trades:
+                 continue
++            if args.max_trades_per_year > 0 and annualized_trade_count(result) > args.max_trades_per_year:
++                continue
+             key = selection_key(result, args.objective)
+             if local_best_key is None or key > local_best_key:
+                 local_best_key = key
+@@ -617,9 +644,13 @@
+                 stop_loss=args.stop_loss,
+                 take_profit=args.take_profit,
+                 max_holding_days=args.max_holding_days,
++                entry_cooldown_days=args.entry_cooldown_days,
++                min_holding_days=args.min_holding_days,
+             )
+             if result is None:
+                 continue
++            if args.max_trades_per_year > 0 and annualized_trade_count(result) > args.max_trades_per_year:
++                continue
+             key = selection_key(result, args.objective)
+             if local_best_key is None or key > local_best_key:
+                 local_best_key = key
+@@ -711,6 +742,8 @@
+         stop_loss=args.stop_loss,
+         take_profit=args.take_profit,
+         max_holding_days=args.max_holding_days,
++        entry_cooldown_days=args.entry_cooldown_days,
++        min_holding_days=args.min_holding_days,
+     )
+     if train_result is None:
+         return None
+@@ -851,6 +884,10 @@
+             days = max(1, (d1 - d0).days + 1)
+             oos_cagr = (oos_curve[-1] / initial_capital) ** (365.0 / days) - 1.0
+ 
++    all_test_trades: list[dict] = []
++    for item in rows:
++        all_test_trades.extend(item.test_result.trades)
++
+     payload = {
+         "meta": meta,
+         "fold_count": len(rows),
+@@ -860,6 +897,13 @@
+         "avg_test_calmar": (sum(r.test_result.calmar for r in rows) / len(rows)) if rows else 0.0,
+         "avg_test_max_drawdown": (sum(r.test_result.max_drawdown for r in rows) / len(rows)) if rows else 0.0,
+         "total_test_trades": sum(r.test_result.trade_count for r in rows),
++        "avg_test_annualized_trades": (
++            sum(annualized_trade_count(r.test_result) for r in rows) / len(rows)
++        )
++        if rows
++        else 0.0,
++        "top_test_markets_by_buy_count": top_markets_by_trade_count(all_test_trades, side_prefix="buy", top_n=15),
++        "top_test_markets_by_sell_count": top_markets_by_trade_count(all_test_trades, side_prefix="sell", top_n=15),
+         "oos_total_return": oos_total_return,
+         "oos_cagr": oos_cagr,
+         "oos_mdd": oos_mdd,
+@@ -884,6 +928,12 @@
+                 "test_calmar": r.test_result.calmar,
+                 "test_max_drawdown": r.test_result.max_drawdown,
+                 "test_trade_count": r.test_result.trade_count,
++                "test_top_markets_by_buy_count": top_markets_by_trade_count(
++                    r.test_result.trades, side_prefix="buy", top_n=8
++                ),
++                "test_top_markets_by_sell_count": top_markets_by_trade_count(
++                    r.test_result.trades, side_prefix="sell", top_n=8
++                ),
+             }
+             for r in rows
+         ],
+@@ -906,16 +956,17 @@
+     p.add_argument("--min-market-days", type=int, default=30)
+     p.add_argument("--min-train-trades", type=int, default=20)
+     p.add_argument("--select-mode", type=str, default="validation", choices=["train", "validation"])
+-    p.add_argument("--objective", type=str, default="sharpe", choices=["sharpe", "return"])
++    p.add_argument("--objective", type=str, default="return", choices=["sharpe", "return"])
+     p.add_argument("--val-days", type=int, default=120)
+     p.add_argument("--min-val-trades", type=int, default=8)
++    p.add_argument("--max-trades-per-year", type=float, default=90.0)
+ 
+     p.add_argument("--lag-modes", type=str, default="global,market")
+     p.add_argument("--global-lags", type=str, default="0,1,2,3,5,7,10")
+     p.add_argument("--max-lag-est", type=int, default=30)
+-    p.add_argument("--lookback-grid", type=str, default="3,5,10")
+-    p.add_argument("--enter-grid", type=str, default="0.0005,0.001,0.002")
+-    p.add_argument("--exit-grid", type=str, default="-0.0005,-0.001")
++    p.add_argument("--lookback-grid", type=str, default="5,10,20")
++    p.add_argument("--enter-grid", type=str, default="0.001,0.002,0.004")
++    p.add_argument("--exit-grid", type=str, default="-0.001,-0.002,-0.004")
+     p.add_argument("--min-corr-grid", type=str, default="0.0,0.1")
+     p.add_argument("--require-lag-min", type=int, default=None)
+     p.add_argument("--require-lag-max", type=int, default=None)
+@@ -934,13 +985,15 @@
+     p.add_argument("--cycle-score-weight-grid", type=str, default="0.0")
+ 
+     p.add_argument("--initial-capital", type=float, default=1_000_000)
+-    p.add_argument("--max-positions", type=int, default=3)
+-    p.add_argument("--rebalance-every", type=int, default=5)
+-    p.add_argument("--fee-bps", type=float, default=0.05)
++    p.add_argument("--max-positions", type=int, default=2)
++    p.add_argument("--rebalance-every", type=int, default=7)
++    p.add_argument("--fee-bps", type=float, default=1.0)
+     p.add_argument("--slippage-bps", type=float, default=0.0)
+     p.add_argument("--stop-loss", type=float, default=0.08)
+     p.add_argument("--take-profit", type=float, default=0.20)
+-    p.add_argument("--max-holding-days", type=int, default=90)
++    p.add_argument("--max-holding-days", type=int, default=120)
++    p.add_argument("--entry-cooldown-days", type=int, default=3)
++    p.add_argument("--min-holding-days", type=int, default=3)
+ 
+     p.add_argument("--notify-bell", action="store_true")
+     p.add_argument("--out-csv", type=str, default="/tmp/btc_lag_walkforward_top50.csv")
+@@ -958,6 +1011,12 @@
+         raise SystemExit("--step-days must be >= 1")
+     if args.max_positions < 1:
+         raise SystemExit("--max-positions must be >= 1")
++    if args.entry_cooldown_days < 0:
++        raise SystemExit("--entry-cooldown-days must be >= 0")
++    if args.min_holding_days < 0:
++        raise SystemExit("--min-holding-days must be >= 0")
++    if args.max_trades_per_year < 0:
++        raise SystemExit("--max-trades-per-year must be >= 0")
+ 
+     overlap_rows = load_overlap_rows(args.summary, args.min_overlap_rows)
+     if not overlap_rows:
+@@ -993,7 +1052,9 @@
+ 
+     print(
+         f"walk-forward start: folds={len(fold_starts)} cfgs={len(cfg_grid)} "
+-        f"markets={len(overlap_series)} btc_dates={len(btc_dates)}"
++        f"markets={len(overlap_series)} btc_dates={len(btc_dates)} "
++        f"fee_bps={args.fee_bps} cooldown={args.entry_cooldown_days} "
++        f"min_hold={args.min_holding_days} max_trades_per_year={args.max_trades_per_year}"
+     )
+     if args.notify_bell:
+         print("\a", end="", flush=True)
+@@ -1037,6 +1098,8 @@
+             stop_loss=args.stop_loss,
+             take_profit=args.take_profit,
+             max_holding_days=args.max_holding_days,
++            entry_cooldown_days=args.entry_cooldown_days,
++            min_holding_days=args.min_holding_days,
+         )
+         if test_result is None:
+             print("  skip: selected config invalid on test window")
+@@ -1094,6 +1157,14 @@
+         "cfg_count": len(cfg_grid),
+         "market_count": len(overlap_series),
+         "initial_capital": args.initial_capital,
++        "objective": args.objective,
++        "fee_bps": args.fee_bps,
++        "slippage_bps": args.slippage_bps,
++        "entry_cooldown_days": args.entry_cooldown_days,
++        "min_holding_days": args.min_holding_days,
++        "max_trades_per_year": args.max_trades_per_year,
++        "rebalance_every": args.rebalance_every,
++        "max_positions": args.max_positions,
+     }
+     write_summary_json(args.out_json, outcomes, meta)
+ 
+--- a/btc_lag_backtest.py
++++ b/btc_lag_backtest.py
+@@ -319,7 +319,7 @@
+     p.add_argument("--initial-capital", type=float, default=1_000_000)
+     p.add_argument("--max-positions", type=int, default=3)
+     p.add_argument("--rebalance-every", type=int, default=5)
+-    p.add_argument("--fee-bps", type=float, default=0.05)
++    p.add_argument("--fee-bps", type=float, default=1.0)
+     p.add_argument("--slippage-bps", type=float, default=0.0)
+     p.add_argument("--stop-loss", type=float, default=0.08)
+     p.add_argument("--take-profit", type=float, default=0.20)
+--- a/cycle_period_walkforward.py
++++ b/cycle_period_walkforward.py
+@@ -635,7 +635,7 @@
+     p.add_argument("--initial-capital", type=float, default=1_000_000)
+     p.add_argument("--max-positions", type=int, default=3)
+     p.add_argument("--rebalance-every", type=int, default=5)
+-    p.add_argument("--fee-bps", type=float, default=0.05)
++    p.add_argument("--fee-bps", type=float, default=1.0)
+     p.add_argument("--slippage-bps", type=float, default=0.0)
+     p.add_argument("--stop-loss", type=float, default=0.08)
+     p.add_argument("--take-profit", type=float, default=0.20)
+--- a/rolling_rotation_walkforward.py
++++ b/rolling_rotation_walkforward.py
+@@ -223,7 +223,7 @@
+     p.add_argument("--max-windows", type=int, default=0)
+     p.add_argument("--initial-capital", type=float, default=1_000_000)
+     p.add_argument("--max-positions", type=int, default=1)
+-    p.add_argument("--fee-bps", type=float, default=5.0)
++    p.add_argument("--fee-bps", type=float, default=1.0)
+     p.add_argument("--slippage-bps", type=float, default=5.0)
+ 
+     p.add_argument("--rb-grid", type=str, default="3,5")
+--- a/run_fee001_overtrade_backtest.sh
++++ b/run_fee001_overtrade_backtest.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SUMMARY="${SUMMARY:-/tmp/upbit_okx_overlap_all_v2_summary.json}"
++DATA_DIR="${DATA_DIR:-/tmp/upbit_okx_overlap_all_v2/upbit}"
++RANK_CSV="${RANK_CSV:-/tmp/top50_overlap_by_upbit_volume.csv}"
++OUT_CSV="${OUT_CSV:-/tmp/btc_lag_walkforward_fee001_best.csv}"
++OUT_JSON="${OUT_JSON:-/tmp/btc_lag_walkforward_fee001_best.json}"
++PROFILE="${PROFILE:-aggressive}"
++
++case "$PROFILE" in
++  aggressive)
++    REBALANCE_EVERY=5
++    ENTRY_COOLDOWN_DAYS=2
++    MIN_HOLDING_DAYS=2
++    MAX_TRADES_PER_YEAR=110
++    ;;
++  balanced)
++    REBALANCE_EVERY=10
++    ENTRY_COOLDOWN_DAYS=3
++    MIN_HOLDING_DAYS=3
++    MAX_TRADES_PER_YEAR=70
++    ;;
++  *)
++    echo "invalid PROFILE=$PROFILE (allowed: aggressive|balanced)" >&2
++    exit 1
++    ;;
++esac
++
++python3 btc_lag_walkforward.py \
++  --summary "$SUMMARY" \
++  --data-dir "$DATA_DIR" \
++  --rank-csv "$RANK_CSV" \
++  --top-n 50 \
++  --train-days 540 \
++  --test-days 120 \
++  --step-days 120 \
++  --min-overlap-rows 120 \
++  --min-market-days 30 \
++  --min-train-trades 0 \
++  --select-mode train \
++  --objective return \
++  --lag-modes global \
++  --global-lags 1 \
++  --max-lag-est 30 \
++  --lookback-grid 5 \
++  --enter-grid 0.001 \
++  --exit-grid=-0.001 \
++  --min-corr-grid 0.0 \
++  --regime-modes off \
++  --cycle-modes filter \
++  --cycle-min-corr-grid 0.03 \
++  --cycle-enter-min-grid 0.0 \
++  --cycle-exit-max-grid -0.0002 \
++  --cycle-score-weight-grid 0.0 \
++  --initial-capital 1000000 \
++  --max-positions 3 \
++  --rebalance-every "$REBALANCE_EVERY" \
++  --fee-bps 1.0 \
++  --slippage-bps 0.0 \
++  --stop-loss 0.08 \
++  --take-profit 0.20 \
++  --max-holding-days 90 \
++  --entry-cooldown-days "$ENTRY_COOLDOWN_DAYS" \
++  --min-holding-days "$MIN_HOLDING_DAYS" \
++  --max-trades-per-year "$MAX_TRADES_PER_YEAR" \
++  --out-csv "$OUT_CSV" \
++  --out-json "$OUT_JSON"
++
++python3 - <<'PY' "$OUT_JSON"
++import json
++import sys
++
++path = sys.argv[1]
++with open(path, encoding='utf-8') as f:
++    j = json.load(f)
++
++print('summary_file=', path)
++print('oos_total_return=', round(j.get('oos_total_return', 0.0) * 100, 2), '%')
++print('oos_cagr=', round(j.get('oos_cagr', 0.0) * 100, 2), '%')
++print('oos_mdd=', round(j.get('oos_mdd', 0.0) * 100, 2), '%')
++print('total_test_trades=', j.get('total_test_trades', 0))
++print('avg_test_annualized_trades=', round(j.get('avg_test_annualized_trades', 0.0), 2))
++print('top_test_markets_by_buy_count=', j.get('top_test_markets_by_buy_count', [])[:10])
++PY
++
++echo "profile=$PROFILE"
++echo "saved_csv=$OUT_CSV"
++echo "saved_json=$OUT_JSON"
+--- a/PATCH_README_fee001.md
++++ b/PATCH_README_fee001.md
+@@ -0,0 +1,71 @@
++# Fee 0.01% + Overtrading Guard Patch
++
++This patch updates the coin selection/trading backtest workflow with:
++- Fee default set to `0.01%` per side (`--fee-bps 1.0`)
++- Overtrading controls in engine:
++  - `entry_cooldown_days`
++  - `min_holding_days`
++- Walk-forward selection guard:
++  - `max_trades_per_year`
++- Test-market selection summary in JSON output.
++- Reproducible profitable rule profile script (`aggressive`/`balanced`).
++
++## Files changed
++- `upbit_strategy_engine.py`
++- `btc_lag_walkforward.py`
++- `btc_lag_backtest.py`
++- `cycle_period_walkforward.py`
++- `rolling_rotation_walkforward.py`
++- `run_fee001_overtrade_backtest.sh` (new)
++
++## Apply patch on another server
++Run in the project root:
++
++```bash
++patch -p1 < fee001_overtrade_patch.patch
++```
++
++## Run backtest after patch
++
++```bash
++./run_fee001_overtrade_backtest.sh
++```
++
++Run with reduced trade frequency profile:
++
++```bash
++PROFILE=balanced ./run_fee001_overtrade_backtest.sh
++```
++
++Optional env overrides:
++
++```bash
++SUMMARY=/tmp/upbit_okx_overlap_all_v2_summary.json \
++DATA_DIR=/tmp/upbit_okx_overlap_all_v2/upbit \
++RANK_CSV=/tmp/top50_overlap_by_upbit_volume.csv \
++OUT_CSV=/tmp/btc_lag_walkforward_fee001_best.csv \
++OUT_JSON=/tmp/btc_lag_walkforward_fee001_best.json \
++PROFILE=aggressive \
++./run_fee001_overtrade_backtest.sh
++```
++
++## Expected outputs
++- CSV: `/tmp/btc_lag_walkforward_fee001_best.csv`
++- JSON: `/tmp/btc_lag_walkforward_fee001_best.json`
++
++The JSON includes:
++- OOS performance (`oos_total_return`, `oos_cagr`, `oos_mdd`)
++- Trade activity (`total_test_trades`, `avg_test_annualized_trades`)
++- Selected market frequency (`top_test_markets_by_buy_count`, `top_test_markets_by_sell_count`)
++
++## Verified profiles (fee 0.01%, slippage 0%)
++- `PROFILE=aggressive`: higher return / higher turnover
++  - OOS total return: about `+202.42%`
++  - OOS CAGR: about `+61.75%`
++  - OOS MDD: about `31.74%`
++  - Total test trades: `207` (annualized ~`89.95`)
++- `PROFILE=balanced`: lower turnover / lower return
++  - OOS total return: about `+53.83%`
++  - OOS CAGR: about `+20.58%`
++  - OOS MDD: about `24.94%`
++  - Total test trades: `105` (annualized ~`45.62`)
